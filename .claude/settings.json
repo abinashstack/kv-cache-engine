@@ -1,0 +1,5 @@
+{
+  "hooks": {
+    "before-git-commit": "code-review-graph update --brief"
+  }
+}
