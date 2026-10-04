@@ -11,13 +11,13 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
 from prefix_cache import PrefixCache
-from serving import LiveScheduler
+from serving import LiveScheduler, StreamError
 
 MODEL_NAME = "gpt2"
 MAX_BATCH_SIZE = 4
@@ -38,6 +38,7 @@ async def lifespan(app: FastAPI):
         eos_token_id=model.config.eos_token_id,
         max_batch_size=MAX_BATCH_SIZE,
         prefix_cache=prefix_cache,
+        max_positions=model.config.n_positions,
     )
     scheduler.start()
 
@@ -55,7 +56,7 @@ app = FastAPI(lifespan=lifespan)
 
 class GenerateRequest(BaseModel):
     prompt: str
-    max_new_tokens: int = 50
+    max_new_tokens: int = Field(default=50, ge=1, le=1024)
     system_prompt: Optional[str] = None
 
 
@@ -73,14 +74,22 @@ async def generate(req: GenerateRequest):
     else:
         prompt_ids = tokenizer(req.prompt, return_tensors="pt").input_ids[0].tolist()
 
-    live_req = scheduler.submit(prompt_ids, req.max_new_tokens, shared_prefix_len=shared_prefix_len)
+    try:
+        live_req = scheduler.submit(prompt_ids, req.max_new_tokens, shared_prefix_len=shared_prefix_len)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
     async def token_stream():
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         while True:
             token = await loop.run_in_executor(None, live_req.output_queue.get)
             if token is None:
                 break
+            if isinstance(token, StreamError):
+                yield f"\n[error: {token.message}]"
+                continue
             yield tokenizer.decode([token])
 
     return StreamingResponse(token_stream(), media_type="text/plain")
